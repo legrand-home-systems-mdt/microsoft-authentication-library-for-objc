@@ -26,8 +26,8 @@
 //------------------------------------------------------------------------------
 
 #import "MSALTestAppTelemetryViewController.h"
-#import "MSALTestAppTelemetryDispatcher.h"
 #import "MSIDTelemetryEventStrings.h"
+#import "MSALTelemetry.h"
 #import <MSAL/MSALGlobalConfig.h>
 #import <MSAL/MSALTelemetryConfig.h>
 
@@ -69,28 +69,24 @@
     return self;
 }
 
-#pragma mark -
 #pragma mark - Tracking
 
 - (void)startTracking
 {
-    MSALTestAppTelemetryDispatcher *dispatcher = [MSALTestAppTelemetryDispatcher new];
-    
-    [dispatcher setDispatcherCallback:^(NSArray<NSDictionary<NSString *, NSString *> *> *events)
-     {
-         [_telemetryEvents addObjectsFromArray:events];
-         [self refresh];
-     }];
-    
-    [MSALGlobalConfig.telemetryConfig addDispatcher:dispatcher setTelemetryOnFailure:NO];
+    MSALGlobalConfig.telemetryConfig.telemetryCallback = ^(NSDictionary<NSString *, NSString *> *event)
+    {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [_telemetryEvents addObject:event];
+            [self refresh];
+        });
+    };
 }
 
 - (void)stopTracking
 {
-    [MSALGlobalConfig.telemetryConfig removeAllDispatchers];
+    MSALGlobalConfig.telemetryConfig.telemetryCallback = nil;
 }
 
-#pragma mark -
 #pragma mark - UI Lifecycle
 
 - (void)viewDidLoad
@@ -106,13 +102,12 @@
 
 - (void)viewWillAppear:(BOOL)animated
 {
-    (void)animated;
-    self.navigationController.navigationBarHidden = NO;
     [super viewWillAppear:animated];
+    
+    self.navigationController.navigationBarHidden = NO;
 }
 
-#pragma mark -
-#pragma mark Methods for subclasses to override
+#pragma mark - Methods for subclasses to override
 
 - (void)refresh
 {
@@ -139,8 +134,7 @@
     }
 }
 
-#pragma mark -
-#pragma mark UITableViewDelegate
+#pragma mark - UITableViewDelegate
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
@@ -158,7 +152,6 @@
     [self refresh];
 }
 
-#pragma mark -
 #pragma mark - Actions
 
 - (IBAction)clearTelemetry:(id)sender
@@ -169,7 +162,6 @@
     [self refresh];
 }
 
-#pragma mark -
 #pragma mark - Helpers
 
 - (NSString *)eventAsShortString:(NSDictionary *)telemetryEvent

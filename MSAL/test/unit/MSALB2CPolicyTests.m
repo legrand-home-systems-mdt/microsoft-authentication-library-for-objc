@@ -40,7 +40,6 @@
 #import "MSALAccountId.h"
 #import "MSIDBaseToken.h"
 #import "MSIDAADV2Oauth2Factory.h"
-#import "MSIDAuthorityFactory.h"
 #import "MSIDB2CAuthority.h"
 #import "MSIDAADNetworkConfiguration.h"
 #import "NSString+MSALTestUtil.h"
@@ -50,6 +49,12 @@
 
 #import "MSALResult.h"
 #import "MSALAccount.h"
+#import "MSALInteractiveTokenParameters.h"
+#import "MSALWebviewParameters.h"
+#import "XCTestCase+HelperMethods.h"
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 @interface MSALB2CPolicyTests : MSALTestCase
 
@@ -142,15 +147,19 @@
     application.webviewType = MSALWebviewTypeWKWebView;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"Acquire Token."];
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakeb2cscopes"]];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.parentViewController = [self.class sharedViewControllerStub];
 
-    [application acquireTokenForScopes:@[@"fakeb2cscopes"]
-                       completionBlock:^(MSALResult *result, NSError *error)
+    [application acquireTokenWithParameters:parameters
+                            completionBlock:^(MSALResult *result, NSError *error)
      {
          XCTAssertNil(error);
          XCTAssertNotNil(result);
 
          NSString *userIdentifier = [NSString stringWithFormat:@"1-b2c_1_policy.%@", [MSIDTestIdTokenUtil defaultTenantId]];
-         XCTAssertEqualObjects(result.account.homeAccountId.identifier, userIdentifier);
+         XCTAssertEqualObjects(result.account.identifier, userIdentifier);
          [expectation fulfill];
      }];
 
@@ -162,22 +171,23 @@
     // Override oidc and token responses for the second policy
     [self setupURLSessionWithB2CAuthority:secondAuthority policy:@"b2c_2_policy"];
 
+    parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakeb2cscopes"]];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.authority = secondAuthority;
+    
     // Use an authority with a different policy in the second acquiretoken call
     expectation = [self expectationWithDescription:@"Acquire Token."];
-    [application acquireTokenForScopes:@[@"fakeb2cscopes"]
-                  extraScopesToConsent:nil
-                             loginHint:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:nil
-                             authority:secondAuthority
-                         correlationId:nil
-                       completionBlock:^(MSALResult *result, NSError *error) {
+    [application acquireTokenWithParameters:parameters
+                            completionBlock:^(MSALResult *result, NSError *error)
+    {
 
                            XCTAssertNil(error);
                            XCTAssertNotNil(result);
 
                            NSString *userIdentifier = [NSString stringWithFormat:@"1-b2c_2_policy.%@", [MSIDTestIdTokenUtil defaultTenantId]];
-                           XCTAssertEqualObjects(result.account.homeAccountId.identifier, userIdentifier);
+                           XCTAssertEqualObjects(result.account.identifier, userIdentifier);
                            [expectation fulfill];
     }];
 
@@ -208,3 +218,5 @@
 }
 
 @end
+
+#pragma clang diagnostic pop

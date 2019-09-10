@@ -42,6 +42,7 @@
 {
     [super setUp];
     self.testEnvironment = self.class.confProvider.wwEnvironment;
+    self.consentTitle = @"Yes";
 }
 
 #pragma mark - Shared
@@ -76,6 +77,11 @@
     }
 
     [self aadEnterPassword];
+    
+    // Keep me signed in
+    [self acceptMSSTSConsentIfNecessary:@"Yes" embeddedWebView:request.usesEmbeddedWebView];
+    
+    // Consent
     [self acceptMSSTSConsentIfNecessary:self.consentTitle ? self.consentTitle : @"Accept" embeddedWebView:request.usesEmbeddedWebView];
 
     [self assertAccessTokenNotNil];
@@ -105,6 +111,7 @@
     request.testAccount = [self.primaryAccount copy];
     request.webViewType = MSALWebviewTypeWKWebView;
     request.requestIDP = @"Microsoft";
+    request.promptBehavior = @"force";
     request.configurationAuthority = [self.class.confProvider b2cAuthorityForIdentifier:self.testEnvironment tenantName:self.primaryAccount.tenantName policy:self.testConfiguration.policies[@"signin"]];
     request.expectedResultAuthority = [self.class.confProvider b2cAuthorityForIdentifier:self.testEnvironment tenantName:self.primaryAccount.homeTenantId policy:self.testConfiguration.policies[@"signin"]];
     request.cacheAuthority = [self.class.confProvider defaultAuthorityForIdentifier:self.testEnvironment tenantId:self.primaryAccount.homeTenantId];
@@ -139,6 +146,7 @@
     request.testAccount = [self.primaryAccount copy];
     request.webViewType = MSALWebviewTypeWKWebView;
     request.requestIDP = @"Microsoft";
+    request.promptBehavior = @"force";
     request.configurationAuthority = [self.class.confProvider b2cAuthorityForIdentifier:self.testEnvironment tenantName:self.primaryAccount.targetTenantId policy:self.testConfiguration.policies[@"signin"]];
     request.expectedResultAuthority = [self.class.confProvider b2cAuthorityForIdentifier:self.testEnvironment tenantName:self.primaryAccount.homeTenantId policy:self.testConfiguration.policies[@"signin"]];
     request.cacheAuthority = [self.class.confProvider defaultAuthorityForIdentifier:self.testEnvironment tenantId:self.primaryAccount.homeTenantId];
@@ -153,7 +161,6 @@
     // 3. Run UI appeared step
     [self runSharedAuthUIAppearsStepWithTestRequest:request];
     request.homeAccountIdentifier = homeAccountId;
-
     // 4. Run silent login
     request.testAccount = nil;
     [self runSharedSilentAADLoginWithTestRequest:request];
@@ -225,6 +232,7 @@
     profileRequest.extraScopes = profileRequest.requestScopes;
     profileRequest.testAccount = self.primaryAccount;
     profileRequest.usePassedWebView = YES;
+    profileRequest.loginHint = self.primaryAccount.username;
     profileRequest.requestIDP = @"Microsoft";
     profileRequest.configurationAuthority = [self.class.confProvider b2cAuthorityForIdentifier:self.testEnvironment tenantName:self.primaryAccount.targetTenantId policy:self.testConfiguration.policies[@"profile"]];
     profileRequest.expectedResultAuthority = [self.class.confProvider b2cAuthorityForIdentifier:self.testEnvironment tenantName:self.primaryAccount.homeTenantId policy:self.testConfiguration.policies[@"profile"]];
