@@ -34,6 +34,7 @@
 #import "MSIDDefaultTokenCacheAccessor.h"
 #import "MSALSilentTokenParameters.h"
 #import "WebKit/WebKit.h"
+#import "MSALWebviewParameters.h"
 
 static NSString * const clientId = @"clientId";
 static NSString * const redirectUri = @"redirectUri";
@@ -53,19 +54,24 @@ static NSString * const defaultScope = @"User.Read";
 @property (weak) IBOutlet NSSegmentedControl *validateAuthoritySegment;
 @property (weak) IBOutlet NSStackView *acquireTokenView;
 @property (weak) IBOutlet WKWebView *webView;
+@property (weak) IBOutlet NSPopUpButton *userPopup;
 
 
 @property MSALTestAppSettings *settings;
 @property NSArray *selectedScopes;
+@property NSArray<MSALAccount *> *accounts;
 
 @end
 
 @implementation MSALAcquireTokenViewController
 
-- (void)viewDidLoad {
+- (void)viewDidLoad
+{
     [super viewDidLoad];
+    
     self.settings = [MSALTestAppSettings settings];
     [self populateProfiles];
+    [self populateUsers];
     self.selectedScopes = @[defaultScope];
     self.validateAuthoritySegment.selectedSegment = self.settings.validateAuthority ? 0 : 1;
 }
@@ -77,6 +83,23 @@ static NSString * const defaultScope = @"User.Read";
     [self.profilesPopUp selectItemWithTitle:[MSALTestAppSettings currentProfileName]];
     self.clientIdTextField.stringValue = [[MSALTestAppSettings currentProfile] objectForKey:clientId];
     self.redirectUriTextField.stringValue = [[MSALTestAppSettings currentProfile] objectForKey:redirectUri];
+}
+
+- (void)populateUsers
+{
+    NSError *error = nil;
+    MSALPublicClientApplication *application = [self createPublicClientApplication:&error];
+    [self.userPopup removeAllItems];
+    
+    if (application && !error)
+    {
+        self.accounts = [application allAccounts:&error];
+        
+        for (MSALAccount *account in self.accounts)
+        {
+            [self.userPopup addItemWithTitle:account.username];
+        }
+    }
 }
 
 - (IBAction)selectedProfileChanged:(id)sender
@@ -113,7 +136,7 @@ static NSString * const defaultScope = @"User.Read";
 - (void)updateResultView:(MSALResult *)result
 {
     NSString *resultText = [NSString stringWithFormat:@"{\n\taccessToken = %@\n\texpiresOn = %@\n\ttenantId = %@\n\tuser = %@\n\tscopes = %@\n\tauthority = %@\n}",
-                            [result.accessToken msidTokenHash], result.expiresOn, result.tenantId, result.account, result.scopes, result.authority];
+                            [result.accessToken msidTokenHash], result.expiresOn, result.tenantProfile.tenantId, result.account, result.scopes, result.authority];
     
     [self.resultTextView setString:resultText];
     
@@ -276,6 +299,7 @@ static NSString * const defaultScope = @"User.Read";
             if (result)
             {
                 [self updateResultView:result];
+                [self populateUsers];
             }
             else
             {
@@ -289,34 +313,28 @@ static NSString * const defaultScope = @"User.Read";
         });
     };
     
+    MSALWebviewParameters *webviewParameters = [MSALWebviewParameters new];
     if ([self passedInWebview])
     {
-        application.customWebview = self.webView;
+        webviewParameters.customWebview = self.webView;
         [self.acquireTokenView setHidden:YES];
         [self.webView setHidden:NO];
     }
     
     NSDictionary *extraQueryParameters = [NSDictionary msidDictionaryFromWWWFormURLEncodedString:[self.extraQueryParamsTextField stringValue]];
-    MSALInteractiveTokenParameters *parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:self.selectedScopes];
+    MSALInteractiveTokenParameters *parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:self.selectedScopes
+                                                                                      webviewParameters:webviewParameters];
     parameters.loginHint = [self.loginHintTextField stringValue];
     parameters.account = self.settings.currentAccount;
     parameters.promptType = [self promptType];
     parameters.extraQueryParameters = extraQueryParameters;
     
     [application acquireTokenWithParameters:parameters completionBlock:completionBlock];
-    
 }
 
 - (IBAction)acquireTokenSilent:(id)sender
 {
     (void)sender;
-    
-    if (!self.settings.currentAccount)
-    {
-        [self showAlert:@"Error!" informativeText:@"User needs to be selected for acquire token silent call"];
-        return;
-    }
-    
     NSError *error = nil;
     MSALPublicClientApplication *application = [self createPublicClientApplication:&error];
     if (!application || error)
@@ -328,8 +346,29 @@ static NSString * const defaultScope = @"User.Read";
     
     __block BOOL fBlockHit = NO;
     
-    __auto_type account = self.settings.currentAccount;
-    MSALSilentTokenParameters *parameters = [[MSALSilentTokenParameters alloc] initWithScopes:self.selectedScopes account:account];
+    NSString *userName = [self.userPopup titleOfSelectedItem];
+    MSALAccount *currentAccount = nil;
+    
+    if (!self.accounts)
+    {
+        self.accounts = [application allAccounts:nil];
+    }
+    
+    for (MSALAccount *account in self.accounts)
+    {
+        if ([account.username isEqualToString:userName])
+        {
+            currentAccount = account;
+        }
+    }
+    
+    if (!currentAccount)
+    {
+        [self showAlert:@"Error!" informativeText:@"User needs to be selected for acquire token silent call"];
+        return;
+    }
+    
+    MSALSilentTokenParameters *parameters = [[MSALSilentTokenParameters alloc] initWithScopes:self.selectedScopes account:currentAccount];
     parameters.authority = self.settings.authority;
     
     [application acquireTokenSilentWithParameters:parameters completionBlock:^(MSALResult *result, NSError *error)
