@@ -75,12 +75,23 @@
 #import "MSIDTestURLResponse+Util.h"
 #import "MSIDVersion.h"
 #import "MSIDConstants.h"
+#import "MSALTenantProfile.h"
 #import "MSALClaimsRequest.h"
+#import "MSALAccountId+Internal.h"
+#import "MSIDAccountMetadataCacheAccessor.h"
+#import "MSALInteractiveTokenParameters.h"
+#import "MSALWebviewParameters.h"
+#import "MSALSilentTokenParameters.h"
+#import "XCTestCase+HelperMethods.h"
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 @interface MSALAcquireTokenTests : MSALTestCase
 
 @property (nonatomic) MSIDDefaultTokenCacheAccessor *tokenCache;
 @property (nonatomic) MSIDAccountCredentialCache *accountCache;
+@property (nonatomic) MSIDAccountMetadataCacheAccessor *accountMetadataCache;
 
 @end
 
@@ -90,7 +101,7 @@
 {
     [super setUp];
     
-    id<MSIDTokenCacheDataSource> dataSource;
+    id<MSIDExtendedTokenCacheDataSource> dataSource;
 #if TARGET_OS_IPHONE
     dataSource = MSIDKeychainTokenCache.defaultKeychainCache;
 #else
@@ -98,8 +109,10 @@
 #endif
     self.tokenCache = [[MSIDDefaultTokenCacheAccessor alloc] initWithDataSource:dataSource otherCacheAccessors:nil];
     self.accountCache = [[MSIDAccountCredentialCache alloc] initWithDataSource:dataSource];
+    self.accountMetadataCache = [[MSIDAccountMetadataCacheAccessor alloc] initWithDataSource:dataSource];
     [self.accountCache clearWithContext:nil error:nil];
     [self.tokenCache clearWithContext:nil error:nil];
+    
     MSIDAADNetworkConfiguration.defaultConfiguration.aadApiVersion = @"v2.0";
 }
 
@@ -108,6 +121,101 @@
     [super tearDown];
     
     MSIDAADNetworkConfiguration.defaultConfiguration.aadApiVersion = nil;
+}
+
+- (void)testAcquireTokenInteractiveWithParameters_whenB2CAuthority_shouldCacheTokens
+{
+    [MSALTestBundle overrideBundleId:@"com.microsoft.unittests"];
+    NSArray* override = @[ @{ @"CFBundleURLSchemes" : @[UNIT_TEST_DEFAULT_REDIRECT_SCHEME] } ];
+    [MSALTestBundle overrideObject:override forKey:@"CFBundleURLTypes"];
+    
+    __auto_type authority = [@"https://login.microsoftonline.com/tfp/contosob2c/b2c_1_policy" msalAuthority];
+    
+    MSIDTestURLResponse *oidcResponse =
+    [MSIDTestURLResponse oidcResponseForAuthority:authority.msidAuthority.url.absoluteString
+                                      responseUrl:@"https://login.microsoftonline.com/contosob2c"
+                                            query:nil];
+    MSIDTestURLResponse *tokenResponse =
+    [MSIDTestURLResponse authCodeResponse:@"iamauthcode"
+                                authority:@"https://login.microsoftonline.com/contosob2c"
+                                    query:nil
+                                   scopes:[NSOrderedSet orderedSetWithArray:@[@"fakeb2cscopes", @"openid", @"profile", @"offline_access"]]
+                                   claims:nil];
+    
+    [MSIDTestURLSession addResponses:@[oidcResponse, tokenResponse]];
+    
+    [MSIDTestSwizzle classMethod:@selector(startEmbeddedWebviewAuthWithConfiguration:oauth2Factory:webview:context:completionHandler:)
+                           class:[MSIDWebviewAuthorization class]
+                           block:(id)^(id obj, MSIDWebviewConfiguration *configuration, MSIDOauth2Factory *oauth2Factory, WKWebView *webview, id<MSIDRequestContext>context, MSIDWebviewAuthCompletionHandler completionHandler)
+     {
+         NSString *responseString = [NSString stringWithFormat:UNIT_TEST_DEFAULT_REDIRECT_URI"?code=iamauthcode"];
+         
+         MSIDWebAADAuthResponse *oauthResponse = [[MSIDWebAADAuthResponse alloc] initWithURL:[NSURL URLWithString:responseString]
+                                                                                     context:nil error:nil];
+         
+         completionHandler(oauthResponse, nil);
+     }];
+    
+    NSError *error = nil;
+    MSALPublicClientApplication *application =
+    [[MSALPublicClientApplication alloc] initWithClientId:UNIT_TEST_CLIENT_ID
+                                                authority:authority
+                                                    error:&error];
+    XCTAssertNotNil(application);
+    XCTAssertNil(error);
+    
+    // Add authorities to cache
+    MSIDAadAuthorityCacheRecord *record = [MSIDAadAuthorityCacheRecord new];
+    record.networkHost = @"login.microsoftonline.com";
+    record.cacheHost = @"login.windows.net";
+    record.aliases = @[@"login.microsoftonline.com", @"login.windows.net", @"login.microsoft.com"];
+    record.validated = YES;
+    
+    MSIDAadAuthorityCache *cache = [MSIDAadAuthorityCache sharedInstance];
+    [cache setObject:record forKey:@"login.microsoftonline.com"];
+    [cache setObject:record forKey:@"login.windows.net"];
+    [cache setObject:record forKey:@"login.microsoft.com"];
+    
+    __block MSALAccount *resultAccount = nil;
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakeb2cscopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    
+    XCTestExpectation *interactiveExpectation = [self expectationWithDescription:@"acquireTokenForScopes"];
+    [application acquireTokenWithParameters:parameters
+                            completionBlock:^(MSALResult *result, NSError *error)
+     {
+         XCTAssertNil(error);
+         XCTAssertNotNil(result);
+         XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+         XCTAssertEqualObjects(result.authority.url.absoluteString, @"https://login.microsoftonline.com/tfp/1234-5678-90abcdefg/b2c_1_policy");
+         
+         resultAccount = result.account;
+         XCTAssertNotNil(resultAccount);
+         [interactiveExpectation fulfill];
+     }];
+    
+    [self waitForExpectations:@[interactiveExpectation] timeout:1];
+    
+    // Now remove aliases, simulating app restart
+    [[MSIDAadAuthorityCache sharedInstance] removeAllObjects];
+    
+    // Now test that we're able to retrieve cache successfully back
+    XCTestExpectation *silentExpectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
+    
+    [application acquireTokenSilentForScopes:@[@"fakeb2cscopes"]
+                                     account:resultAccount
+                             completionBlock:^(MSALResult *result, NSError *error) {
+                                 
+                                 XCTAssertNil(error);
+                                 XCTAssertNotNil(result);
+                                 XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+                                 XCTAssertEqualObjects(result.authority.url.absoluteString, @"https://login.microsoftonline.com/tfp/1234-5678-90abcdefg/b2c_1_policy");
+                                 [silentExpectation fulfill];
+                             }];
+    
+    [self waitForExpectations:@[silentExpectation] timeout:1];
 }
 
 - (void)testAcquireTokenInteractive_whenB2CAuthority_shouldCacheTokens
@@ -151,7 +259,7 @@
     XCTAssertNotNil(application);
     XCTAssertNil(error);
     
-    application.webviewType = MSALWebviewTypeWKWebView;
+//    application.accountMetadataCache = self.accountMetadataCache;
     
     // Add authorities to cache
     MSIDAadAuthorityCacheRecord *record = [MSIDAadAuthorityCacheRecord new];
@@ -165,10 +273,13 @@
     [cache setObject:record forKey:@"login.windows.net"];
     [cache setObject:record forKey:@"login.microsoft.com"];
     
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakeb2cscopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
     __block MSALAccount *resultAccount = nil;
     
     XCTestExpectation *interactiveExpectation = [self expectationWithDescription:@"acquireTokenForScopes"];
-    [application acquireTokenForScopes:@[@"fakeb2cscopes"]
+    [application acquireTokenWithParameters:parameters
                        completionBlock:^(MSALResult *result, NSError *error)
      {
          XCTAssertNil(error);
@@ -188,7 +299,12 @@
     
     // Now test that we're able to retrieve cache successfully back
     XCTestExpectation *silentExpectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
-    
+//
+//    // Save account metadata authority map from common to the specific tenant id.
+//    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:@"https://login.microsoftonline.com/tfp/1234-5678-90abcdefg/b2c_1_policy"]
+//                                    forRequestURL:authority.url
+//                                    homeAccountId:resultAccount.identifier clientId:UNIT_TEST_CLIENT_ID context:nil error:nil];
+//
     [application acquireTokenSilentForScopes:@[@"fakeb2cscopes"]
                                      account:resultAccount
                              completionBlock:^(MSALResult *result, NSError *error) {
@@ -243,11 +359,13 @@
     XCTAssertNotNil(application);
     XCTAssertNil(error);
     
-    application.webviewType = MSALWebviewTypeWKWebView;
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakeb2cscopes"]];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.parentViewController = [self.class sharedViewControllerStub];
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenForScopes"];
-    [application acquireTokenForScopes:@[@"fakeb2cscopes"]
-                       completionBlock:^(MSALResult *result, NSError *error)
+    [application acquireTokenWithParameters:parameters
+                            completionBlock:^(MSALResult *result, NSError *error)
      {
          XCTAssertNil(error);
          XCTAssertNotNil(result);
@@ -280,12 +398,12 @@
                                                                                utid:DEFAULT_TEST_UTID
                                                                            familyId:nil];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     // Add AT & RT.
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
@@ -297,17 +415,22 @@
                                                          error:nil];
     XCTAssertTrue(result);
     
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     NSError *error = nil;
     MSALPublicClientApplication *application =
     [[MSALPublicClientApplication alloc] initWithClientId:UNIT_TEST_CLIENT_ID
                                                     error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
     // Set up the network responses for OIDC discovery and the RT response
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"mail.read", @"openid", @"profile", @"offline_access"]];
     
-    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse errorRtResponseForScopes:expectedScopes authority:authority tenantId:nil account:account errorCode:@"invalid_grant" errorDescription:@"Refresh token revoked" subError:@"unauthorized_client" claims:nil refreshToken:nil];
+    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse errorRtResponseForScopes:expectedScopes authority:authority tenantId:@"1234-5678-90abcdefg" account:account errorCode:@"invalid_grant" errorDescription:@"Refresh token revoked" subError:@"unauthorized_client" claims:nil refreshToken:nil];
     [MSIDTestURLSession addResponses:@[tokenResponse]];
     
     // Acquire a token silently for a scope that does not exist in cache
@@ -349,12 +472,12 @@
                                                                                utid:DEFAULT_TEST_UTID
                                                                            familyId:nil];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     // Add AT & RT.
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
@@ -366,17 +489,22 @@
                                                          error:nil];
     XCTAssertTrue(result);
     
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     NSError *error = nil;
     MSALPublicClientApplication *application =
     [[MSALPublicClientApplication alloc] initWithClientId:UNIT_TEST_CLIENT_ID
                                                     error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     MSALGlobalConfig.brokerAvailability = MSALBrokeredAvailabilityNone;
     
     // Set up the network responses for OIDC discovery and the RT response
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"mail.read", @"openid", @"profile", @"offline_access"]];
-    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:nil user:account claims:nil];
+    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:@"1234-5678-90abcdefg" uid:@"1" user:account claims:nil];
     NSMutableDictionary *json = [[response jsonDictionary] mutableCopy];
     json[@"access_token"] = @"i am an updated access token!";
     json[@"scope"] = [expectedScopes msidToString];
@@ -443,7 +571,6 @@
             @"client-request-id" : [MSIDTestRequireValueSentinel sentinel],
             @"return-client-request-id" : @"true",
             @"state" : [MSIDTestRequireValueSentinel sentinel],
-            @"prompt" : @"select_account",
             @"client_id" : UNIT_TEST_CLIENT_ID,
             @"scope" : @"fakescopes openid profile offline_access",
             @"client_info" : @"1",
@@ -475,22 +602,21 @@
     MSALGlobalConfig.brokerAvailability = MSALBrokeredAvailabilityNone;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireToken"];
-    application.webviewType = MSALWebviewTypeWKWebView;
-    [application acquireTokenForScopes:@[@"fakescopes"]
-                  extraScopesToConsent:nil
-                               account:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:@{@"eqpKey":@"eqpValue"}
-                         claimsRequest:claimsRequest
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *result, NSError *error)
-     {
-         XCTAssertNil(error);
-         XCTAssertNotNil(result);
-         XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
-         [expectation fulfill];
-     }];
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.extraQueryParameters = @{@"eqpKey":@"eqpValue"};
+    parameters.claimsRequest = claimsRequest;
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *result, NSError *error)
+    {
+        XCTAssertNil(error);
+        XCTAssertNotNil(result);
+        XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+        [expectation fulfill];
+    }];
     
     [self waitForExpectations:@[expectation] timeout:1];
 }
@@ -603,25 +729,24 @@
     __auto_type claimsRequest = [[MSALClaimsRequest alloc] initWithJsonString:claims error:nil];
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireToken"];
-    [application acquireTokenForScopes:@[@"fakescopes"]
-                  extraScopesToConsent:nil
-                               account:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:@{@"eqpKey":@"eqpValue", @"claims":@"claims_value"}
-                         claimsRequest:claimsRequest
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *result, NSError *error)
-     {
-         XCTAssertNotNil(error);
-         XCTAssertNil(result);
-         XCTAssertEqualObjects(error.domain, MSALErrorDomain);
-         XCTAssertEqual(error.code, MSALErrorInternal);
-         NSInteger internalErrorCode = [error.userInfo[MSALInternalErrorCodeKey] integerValue];
-         XCTAssertEqual(internalErrorCode, MSALInternalErrorInvalidParameter);
-         XCTAssertEqualObjects(error.userInfo[MSALErrorDescriptionKey], @"Duplicate claims parameter is found in extraQueryParameters. Please remove it.");
-         [expectation fulfill];
-     }];
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.extraQueryParameters = @{@"eqpKey":@"eqpValue", @"claims":@"claims_value"};
+    parameters.claimsRequest = claimsRequest;
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *result, NSError *error)
+    {
+        XCTAssertNotNil(error);
+        XCTAssertNil(result);
+        XCTAssertEqualObjects(error.domain, MSALErrorDomain);
+        XCTAssertEqual(error.code, MSALErrorInternal);
+        NSInteger internalErrorCode = [error.userInfo[MSALInternalErrorCodeKey] integerValue];
+        XCTAssertEqual(internalErrorCode, MSALInternalErrorInvalidParameter);
+        XCTAssertEqualObjects(error.userInfo[MSALErrorDescriptionKey], @"Duplicate claims parameter is found in extraQueryParameters. Please remove it.");
+        [expectation fulfill];
+    }];
     
     [self waitForExpectations:@[expectation] timeout:1];
 }
@@ -666,7 +791,6 @@
             @"client-request-id" : [MSIDTestRequireValueSentinel sentinel],
             @"return-client-request-id" : @"true",
             @"state" : [MSIDTestRequireValueSentinel sentinel],
-            @"prompt" : @"select_account",
             @"client_id" : UNIT_TEST_CLIENT_ID,
             @"scope" : @"fakescopes openid profile offline_access",
             @"client_info" : @"1",
@@ -702,22 +826,20 @@
     MSALGlobalConfig.brokerAvailability = MSALBrokeredAvailabilityNone;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireToken"];
-    application.webviewType = MSALWebviewTypeWKWebView;
-    [application acquireTokenForScopes:@[@"fakescopes"]
-                  extraScopesToConsent:nil
-                               account:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:@{@"eqpKey":@"eqpValue"}
-                         claimsRequest:nil
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *result, NSError *error)
-     {
-         XCTAssertNil(error);
-         XCTAssertNotNil(result);
-         XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
-         [expectation fulfill];
-     }];
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.extraQueryParameters = @{@"eqpKey":@"eqpValue"};
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *result, NSError *error)
+    {
+        XCTAssertNil(error);
+        XCTAssertNotNil(result);
+        XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+        [expectation fulfill];
+    }];
     
     [self waitForExpectations:@[expectation] timeout:1];
 }
@@ -765,7 +887,6 @@
             @"client-request-id" : [MSIDTestRequireValueSentinel sentinel],
             @"return-client-request-id" : @"true",
             @"state" : [MSIDTestRequireValueSentinel sentinel],
-            @"prompt" : @"select_account",
             @"client_id" : UNIT_TEST_CLIENT_ID,
             @"scope" : @"fakescopes openid profile offline_access",
             @"client_info" : @"1",
@@ -790,7 +911,7 @@
     MSALPublicClientApplicationConfig *config = [[MSALPublicClientApplicationConfig alloc] initWithClientId:UNIT_TEST_CLIENT_ID
                                                                                                 redirectUri:nil
                                                                                                   authority:[DEFAULT_TEST_AUTHORITY msalAuthority]];
-    config.clientApplicationCapabilities = @[@"llt"];;
+    config.clientApplicationCapabilities = @[@"llt"];
     
     // Acquire token call
     NSError *error = nil;
@@ -801,22 +922,21 @@
     MSALGlobalConfig.brokerAvailability = MSALBrokeredAvailabilityNone;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireToken"];
-    application.webviewType = MSALWebviewTypeWKWebView;
-    [application acquireTokenForScopes:@[@"fakescopes"]
-                  extraScopesToConsent:nil
-                               account:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:@{@"eqpKey":@"eqpValue"}
-                         claimsRequest:claimsRequest
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *result, NSError *error)
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.claimsRequest = claimsRequest;
+    parameters.extraQueryParameters = @{@"eqpKey":@"eqpValue"};
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *result, NSError *error)
      {
-         XCTAssertNil(error);
-         XCTAssertNotNil(result);
-         XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
-         [expectation fulfill];
-     }];
+        XCTAssertNil(error);
+        XCTAssertNotNil(result);
+        XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+        [expectation fulfill];
+    }];
     
     [self waitForExpectations:@[expectation] timeout:1];
 }
@@ -894,22 +1014,22 @@
     MSALGlobalConfig.brokerAvailability = MSALBrokeredAvailabilityNone;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireToken"];
-    application.webviewType = MSALWebviewTypeWKWebView;
-    [application acquireTokenForScopes:@[@"fakescopes"]
-                  extraScopesToConsent:nil
-                             loginHint:@"upn@test.com"
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:@{@"eqpKey":@"eqpValue"}
-                         claimsRequest:claimsRequest
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *result, NSError *error)
-     {
-         XCTAssertNil(error);
-         XCTAssertNotNil(result);
-         XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
-         [expectation fulfill];
-     }];
+    
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.loginHint = @"upn@test.com";
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.extraQueryParameters = @{@"eqpKey":@"eqpValue"};
+    parameters.claimsRequest = claimsRequest;
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *result, NSError *error)
+    {
+        XCTAssertNil(error);
+        XCTAssertNotNil(result);
+        XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+        [expectation fulfill];
+    }];
     
     [self waitForExpectations:@[expectation] timeout:1];
 }
@@ -960,7 +1080,6 @@
             @"client-request-id" : [MSIDTestRequireValueSentinel sentinel],
             @"return-client-request-id" : @"true",
             @"state" : [MSIDTestRequireValueSentinel sentinel],
-            @"prompt" : @"select_account",
             @"client_id" : UNIT_TEST_CLIENT_ID,
             @"scope" : @"fakescopes openid profile offline_access",
             @"client_info" : @"1",
@@ -996,50 +1115,48 @@
     XCTestExpectation *expectationInteractive = [self expectationWithDescription:@"acquireTokenInteractive"];
     __block MSALResult *result = nil;
     
-    application.webviewType = MSALWebviewTypeWKWebView;
-    [application acquireTokenForScopes:@[@"fakescopes"]
-                  extraScopesToConsent:nil
-                               account:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:@{@"instance_aware":@"true"}
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *rlt, NSError *error)
-     {
-         result = rlt;
-         
-         XCTAssertNil(error);
-         XCTAssertNotNil(result);
-         XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
-         
-         // Expect authority to be cloud authority
-         XCTAssertEqualObjects(result.authority.url.absoluteString, @"https://login.microsoftonline.de/" DEFAULT_TEST_UTID);
-         XCTAssertEqualObjects(result.account.environment, @"login.microsoftonline.de");
-         
-         [expectationInteractive fulfill];
-     }];
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescopes"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.extraQueryParameters = @{@"instance_aware":@"true"};
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *rlt, NSError *error)
+    {
+        result = rlt;
+        
+        XCTAssertNil(error);
+        XCTAssertNotNil(result);
+        XCTAssertEqualObjects(result.accessToken, @"i am an updated access token!");
+        
+        // Expect authority to be cloud authority
+        XCTAssertEqualObjects(result.authority.url.absoluteString, @"https://login.microsoftonline.de/" DEFAULT_TEST_UTID);
+        XCTAssertEqualObjects(result.account.environment, @"login.microsoftonline.de");
+        
+        [expectationInteractive fulfill];
+    }];
     
     [self waitForExpectations:@[expectationInteractive] timeout:1];
     
     // acquire token silently to verify that access token is stored under the correct authority
     XCTestExpectation *expectationSilent = [self expectationWithDescription:@"acquireTokenSilent"];
+    
     MSALAccount *account = result.account;
-    [application acquireTokenSilentForScopes:@[@"fakescopes"]
-                                     account:account
-                                   authority:[@"https://login.microsoftonline.de/" DEFAULT_TEST_UTID msalAuthority]
-                                forceRefresh:NO
-                               correlationId:nil
-                             completionBlock:^(MSALResult *rlt, NSError *error)
-     {
-         XCTAssertNil(error);
-         XCTAssertNotNil(rlt);
-         XCTAssertEqualObjects(rlt.accessToken, @"i am an updated access token!");
-         
-         // authority cloud authority as expected
-         XCTAssertEqualObjects(rlt.authority.url.absoluteString, @"https://login.microsoftonline.de/" DEFAULT_TEST_UTID);
-         
-         [expectationSilent fulfill];
-     }];
+    __auto_type silentParameters = [[MSALSilentTokenParameters alloc] initWithScopes:@[@"fakescopes"] account:account];
+    silentParameters.authority = [@"https://login.microsoftonline.de/" DEFAULT_TEST_UTID msalAuthority];
+    silentParameters.forceRefresh = NO;
+    
+    [application acquireTokenSilentWithParameters:silentParameters completionBlock:^(MSALResult *rlt, NSError *error)
+    {
+        XCTAssertNil(error);
+        XCTAssertNotNil(rlt);
+        XCTAssertEqualObjects(rlt.accessToken, @"i am an updated access token!");
+        
+        // authority cloud authority as expected
+        XCTAssertEqualObjects(rlt.authority.url.absoluteString, @"https://login.microsoftonline.de/" DEFAULT_TEST_UTID);
+        
+        [expectationSilent fulfill];
+    }];
     
     [self waitForExpectations:@[expectationSilent] timeout:1];
 }
@@ -1061,12 +1178,11 @@
     [json setValue:@"-1" forKey:MSID_OAUTH2_EXPIRES_IN];
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
     
-    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"user@contoso.com"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -1079,13 +1195,18 @@
     
     // Set up the network responses for OIDC discovery
     NSString *authority = @"https://login.microsoftonline.com/1234-5678-90abcdefg";
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     MSIDTestURLResponse *discoveryResponse = [MSIDTestURLResponse discoveryResponseForAuthority:authority];
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"user.read", @"openid", @"profile", @"offline_access"]];
     MSIDTestURLResponse *oidcResponse = [MSIDTestURLResponse oidcResponseForAuthority:authority];
     [MSIDTestURLSession addResponses:@[discoveryResponse, oidcResponse]];
     
     // Set up two 504 network responses
-    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:nil user:account claims:nil];
+    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:@"1234-5678-90abcdefg" uid:@"1" user:account claims:nil];
     [tokenResponse setResponseURL:@"https://someresponseurl.com" code:504 headerFields:@{}];
     [MSIDTestURLSession addResponse:tokenResponse]; //Add the responsce twice because retry will happen
     [MSIDTestURLSession addResponse:tokenResponse];
@@ -1098,6 +1219,7 @@
     MSALPublicClientApplication *application = [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -1132,12 +1254,13 @@
                                                                     familyId:nil].jsonDictionary.mutableCopy;
     [json setValue:@"-1" forKey:MSID_OAUTH2_EXPIRES_IN];
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
+    
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -1147,7 +1270,7 @@
                                                        context:nil
                                                          error:nil];
     XCTAssertTrue(result);
-    
+
     // Set up the network responses for OIDC discovery
     NSString *authority = @"https://login.microsoftonline.com/1234-5678-90abcdefg";
     MSIDTestURLResponse *discoveryResponse = [MSIDTestURLResponse discoveryResponseForAuthority:authority];
@@ -1155,8 +1278,13 @@
     MSIDTestURLResponse *oidcResponse = [MSIDTestURLResponse oidcResponseForAuthority:authority];
     [MSIDTestURLSession addResponses:@[discoveryResponse, oidcResponse]];
     
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     // Set up two 504 network responses
-    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:nil user:account claims:nil];
+    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:@"1234-5678-90abcdefg" uid:@"1" user:account claims:nil];
     [tokenResponse setResponseURL:@"https://someresponseurl.com" code:504 headerFields:@{}];
     [MSIDTestURLSession addResponse:tokenResponse]; //Add the responsce twice because retry will happen
     [MSIDTestURLSession addResponse:tokenResponse];
@@ -1169,6 +1297,7 @@
     MSALPublicClientApplication *application = [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -1191,6 +1320,7 @@
 
 - (void)testAcquireTokenSilent_whenATAvailable_andMixedCaseInputScope_shouldReturnToken
 {
+    
     [MSALTestBundle overrideBundleId:@"com.microsoft.unittests"];
     NSArray* override = @[ @{ @"CFBundleURLSchemes" : @[UNIT_TEST_DEFAULT_REDIRECT_SCHEME] } ];
     [MSALTestBundle overrideObject:override forKey:@"CFBundleURLTypes"];
@@ -1204,12 +1334,13 @@
                                                                         utid:DEFAULT_TEST_UTID
                                                                     familyId:nil].jsonDictionary.mutableCopy;
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
-    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+    
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
+    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"user@contoso.com"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
 
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -1221,6 +1352,12 @@
     XCTAssertTrue(result);
 
     NSString *authority = @"https://login.microsoftonline.com/1234-5678-90abcdefg";
+    
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     MSIDTestURLResponse *discoveryResponse = [MSIDTestURLResponse discoveryResponseForAuthority:authority];
     [MSIDTestURLSession addResponse:discoveryResponse];
 
@@ -1229,6 +1366,7 @@
                                                                                                error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
 
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"USeR.reAD"]
@@ -1264,12 +1402,13 @@
     [json setValue:@"-1" forKey:MSID_OAUTH2_EXPIRES_IN];//expire the AT
 
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
+    
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
 
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -1284,10 +1423,17 @@
     NSString *authority = @"https://login.microsoftonline.com/1234-5678-90abcdefg";
     MSIDTestURLResponse *discoveryResponse = [MSIDTestURLResponse discoveryResponseForAuthority:authority];
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"USeR.reAD", @"openid", @"profile", @"offline_access"]];
+    
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+
     // Set up a 200 network responses
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:nil];
 
@@ -1302,6 +1448,7 @@
                                                                                                error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
 
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"USeR.reAD"]
@@ -1337,12 +1484,12 @@
                                                                         utid:DEFAULT_TEST_UTID
                                                                     familyId:nil].jsonDictionary.mutableCopy;
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
-    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+    
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"user@contoso.com"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -1352,6 +1499,7 @@
                                                        context:nil
                                                          error:nil];
     XCTAssertTrue(result);
+
     
     // Set up the network responses for OIDC discovery
     NSString *authority = @"https://login.microsoftonline.com/1234-5678-90abcdefg";
@@ -1360,8 +1508,12 @@
     MSIDTestURLResponse *oidcResponse = [MSIDTestURLResponse oidcResponseForAuthority:authority];
     [MSIDTestURLSession addResponses:@[discoveryResponse, oidcResponse]];
     
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     // Set up two 504 network responses
-    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:nil user:account claims:nil];
+    MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes authority:authority tenantId:@"1234-5678-90abcdefg" uid:@"1" user:account claims:nil];
     [tokenResponse setResponseURL:@"https://someresponseurl.com" code:504 headerFields:@{}];
     [MSIDTestURLSession addResponse:tokenResponse]; //Add the responsce twice because retry will happen
     [MSIDTestURLSession addResponse:tokenResponse];
@@ -1375,6 +1527,7 @@
     MSALPublicClientApplication *application = [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -1445,31 +1598,28 @@
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenInteractive"];
     __block MSALResult *result = nil;
     
-    application.webviewType = MSALWebviewTypeWKWebView;
-    [application acquireTokenForScopes:@[@"fakescope3", @"fakescope4", @"fakescope1"]
-                  extraScopesToConsent:nil
-                               account:nil
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:nil
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *rlt, NSError *error)
-     {
-         result = rlt;
-         
-         XCTAssertNotNil(error);
-         XCTAssertNil(result);
-         XCTAssertEqualObjects(error.domain, MSALErrorDomain);
-         XCTAssertEqual(error.code, MSALErrorServerDeclinedScopes);
-         
-         NSArray *grantedScopesArr = @[@"fakescope1", @"fakescope2", @"additional.scope", @"additional.scope2"];
-         XCTAssertEqualObjects(error.userInfo[MSALGrantedScopesKey], grantedScopesArr);
-         
-         NSArray *declinedScopesArr = @[@"fakescope3", @"fakescope4"];
-         XCTAssertEqualObjects(error.userInfo[MSALDeclinedScopesKey], declinedScopesArr);
-         
-         [expectation fulfill];
-     }];
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescope3", @"fakescope4", @"fakescope1"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.promptType = MSALPromptTypeDefault;
+    
+    [application acquireTokenWithParameters:parameters completionBlock:^(MSALResult *rlt, NSError *error)
+    {
+        result = rlt;
+        
+        XCTAssertNotNil(error);
+        XCTAssertNil(result);
+        XCTAssertEqualObjects(error.domain, MSALErrorDomain);
+        XCTAssertEqual(error.code, MSALErrorServerDeclinedScopes);
+        
+        NSArray *grantedScopesArr = @[@"fakescope1", @"fakescope2", @"additional.scope", @"additional.scope2"];
+        XCTAssertEqualObjects(error.userInfo[MSALGrantedScopesKey], grantedScopesArr);
+        
+        NSArray *declinedScopesArr = @[@"fakescope3", @"fakescope4"];
+        XCTAssertEqualObjects(error.userInfo[MSALDeclinedScopesKey], declinedScopesArr);
+        
+        [expectation fulfill];
+    }];
     
     [self waitForExpectations:@[expectation] timeout:1];
 }
@@ -1489,12 +1639,12 @@
                                                                         utid:DEFAULT_TEST_UTID
                                                                     familyId:nil].jsonDictionary.mutableCopy;
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
+    
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -1514,6 +1664,10 @@
                                       responseUrl:@"https://login.microsoftonline.com/1234-5678-90abcdefg"
                                             query:nil];
     
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:@"https://login.microsoftonline.com/1234-5678-90abcdefg"]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     // Mock token response
     [MSIDTestURLSession addResponse:oidcResponse];
     [self addTestTokenResponseWithResponseScopes:@"user.read fakescope1 additional.scope additional.scope2"
@@ -1529,6 +1683,7 @@
     MSALPublicClientApplication *application = [[MSALPublicClientApplication alloc] initWithClientId:UNIT_TEST_CLIENT_ID
                                                                                            authority:[DEFAULT_TEST_AUTHORITY msalAuthority]
                                                                                                error:&error];
+    application.accountMetadataCache = self.accountMetadataCache;
     XCTAssertNotNil(application);
     XCTAssertNil(error);
     
@@ -1591,17 +1746,17 @@
     // Add mock response for refresh token grant, claims should be in the request body
     NSString *claims = @"{\"access_token\":{\"polids\":{\"values\":[\"5ce770ea-8690-4747-aa73-c5b3cd509cd4\"],\"essential\":true}}}";
     __auto_type claimsRequest = [[MSALClaimsRequest alloc] initWithJsonString:claims error:nil];
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"user.read", @"openid", @"profile", @"offline_access"]];
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:claims];
     NSMutableDictionary *json = [[response jsonDictionary] mutableCopy];
@@ -1610,6 +1765,10 @@
     [tokenResponse setResponseJSON:json];
     [MSIDTestURLSession addResponses:@[tokenResponse]];
     
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     // Acquire a token silently
     NSError *error = nil;
     MSALPublicClientApplication *application =
@@ -1617,6 +1776,7 @@
                                                     error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -1679,13 +1839,20 @@
     [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
-    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
+    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"user@contoso.com"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
+    
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
                                      account:account
@@ -1746,13 +1913,19 @@
     [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
     
-    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
+    
+    MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"user@contoso.com"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
                                      account:account
@@ -1808,17 +1981,17 @@
     
     // Add mock response for refresh token grant, claims should be in the request body
     NSString *expectedClaims =  @"{\"access_token\":{\"xms_cc\":{\"values\":[\"cp1\",\"llt\"]}}}";
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"user.read", @"openid", @"profile", @"offline_access"]];
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:expectedClaims];
     NSMutableDictionary *responseJson = [[response jsonDictionary] mutableCopy];
@@ -1837,6 +2010,11 @@
     [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -1893,17 +2071,17 @@
     NSString *claims = @"{\"access_token\":{\"polids\":{\"values\":[\"5ce770ea-8690-4747-aa73-c5b3cd509cd4\"],\"essential\":true}}}";
     __auto_type claimsRequest = [[MSALClaimsRequest alloc] initWithJsonString:claims error:nil];
     NSString *expectedClaims = @"{\"access_token\":{\"polids\":{\"values\":[\"5ce770ea-8690-4747-aa73-c5b3cd509cd4\"],\"essential\":true},\"xms_cc\":{\"values\":[\"llt\"]}}}";
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"user.read", @"openid", @"profile", @"offline_access"]];
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:expectedClaims];
     NSMutableDictionary *json = [[response jsonDictionary] mutableCopy];
@@ -1922,6 +2100,10 @@
     [[MSALPublicClientApplication alloc] initWithConfiguration:config error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -1977,12 +2159,11 @@
     // Add mock error response for refresh token grant
     NSString *claims = @"{\"access_token\":{\"polids\":{\"values\":[\"5ce770ea-8690-4747-aa73-c5b3cd509cd4\"],\"essential\":true}}}";
     __auto_type claimsRequest = [[MSALClaimsRequest alloc] initWithJsonString:claims error:nil];
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     NSOrderedSet *expectedScopes = [NSOrderedSet orderedSetWithArray:@[@"user.read", @"openid", @"profile", @"offline_access"]];
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse errorRtResponseForScopes:expectedScopes
@@ -2003,6 +2184,11 @@
                                                     error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
     [application acquireTokenSilentForScopes:@[@"user.read"]
@@ -2044,12 +2230,11 @@
     [json setObject:@"-3600" forKey:MSID_OAUTH2_EXPIRES_IN];
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     
@@ -2068,7 +2253,8 @@
     // Set up a 200 network responses
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:nil];
     [tokenResponse setResponseURL:@"https://someresponseurl.com" code:200 headerFields:@{}];
@@ -2081,6 +2267,12 @@
                                                                                                error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     [self removeRefreshTokenFromCache];
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
@@ -2115,12 +2307,11 @@
     [json setObject:@"-3600" forKey:MSID_OAUTH2_EXPIRES_IN];
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     configuration.clientId = UNIT_TEST_CLIENT_ID;
@@ -2139,7 +2330,8 @@
     // Set up a 200 network responses
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:nil];
     
@@ -2153,6 +2345,12 @@
                                                                                                error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     [self removeRefreshTokenFromCache];
     
     NSArray<MSIDAppMetadataCacheItem *> *metadataEntries = [self.tokenCache getAppMetadataEntries:configuration
@@ -2202,12 +2400,11 @@
                                                                                utid:DEFAULT_TEST_UTID
                                                                            familyId:@"1"];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     // Add AT, RT & FRT
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
@@ -2225,6 +2422,11 @@
                                                     error:&error];
     XCTAssertNotNil(application);
     application.tokenCache = self.tokenCache;
+    application.accountMetadataCache = self.accountMetadataCache;
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
     
     [self removeRefreshTokenFromCache];
     NSArray<MSIDAppMetadataCacheItem *> *metadataEntries = [self.tokenCache getAppMetadataEntries:configuration
@@ -2292,12 +2494,11 @@
     [json setObject:@"-3600" forKey:MSID_OAUTH2_EXPIRES_IN];
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     
@@ -2325,7 +2526,8 @@
     // Set up a 200 network responses
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:nil];
     
@@ -2347,6 +2549,11 @@
     NSError *error = nil;
     MSALPublicClientApplication *application = [[MSALPublicClientApplication alloc] initWithClientId:UNIT_TEST_CLIENT_ID
                                                                                                error:&error];
+    application.accountMetadataCache = self.accountMetadataCache;
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     XCTAssertNotNil(application);
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
@@ -2381,12 +2588,11 @@
     [json setObject:@"-3600" forKey:MSID_OAUTH2_EXPIRES_IN];
     MSIDAADV2TokenResponse *response = [[MSIDAADV2TokenResponse alloc] initWithJSONDictionary:json error:nil];
     
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
     MSIDConfiguration *configuration = [MSIDTestConfiguration v2DefaultConfiguration];
     
@@ -2405,7 +2611,8 @@
     // Set up a 200 network responses
     MSIDTestURLResponse *tokenResponse = [MSIDTestURLResponse rtResponseForScopes:expectedScopes
                                                                         authority:authority
-                                                                         tenantId:nil
+                                                                         tenantId:@"1234-5678-90abcdefg"
+                                                                              uid:@"1"
                                                                              user:account
                                                                            claims:nil];
     
@@ -2418,6 +2625,12 @@
     NSError *error = nil;
     MSALPublicClientApplication *application = [[MSALPublicClientApplication alloc] initWithClientId:UNIT_TEST_CLIENT_ID
                                                                                                error:&error];
+    application.accountMetadataCache = self.accountMetadataCache;
+    
+    // Save account metadata authority map from common to the specific tenant id.
+    [self.accountMetadataCache updateAuthorityURL:[NSURL URLWithString:authority]
+                                    forRequestURL:[NSURL URLWithString:@"https://login.microsoftonline.com/common"] homeAccountId:accountID.identifier clientId:UNIT_TEST_CLIENT_ID instanceAware:NO context:nil error:nil];
+    
     XCTAssertNotNil(application);
     
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenSilentForScopes"];
@@ -2489,22 +2702,20 @@
     XCTestExpectation *expectation = [self expectationWithDescription:@"acquireTokenInteractive"];
     __block MSALResult *result = nil;
     
-    application.webviewType = MSALWebviewTypeWKWebView;
+    MSALAccountId *accountID = [[MSALAccountId alloc] initWithAccountIdentifier:@"1.1234-5678-90abcdefg" objectId:@"1" tenantId:@"1234-5678-90abcdefg"];
     MSALAccount *account = [[MSALAccount alloc] initWithUsername:@"preferredUserName"
-                                                            name:@"user@contoso.com"
-                                                   homeAccountId:@"1.1234-5678-90abcdefg"
-                                                  localAccountId:@"1"
+                                                   homeAccountId:accountID
                                                      environment:@"login.microsoftonline.com"
-                                                        tenantId:@"1234-5678-90abcdefg"];
+                                                  tenantProfiles:nil];
     
-    [application acquireTokenForScopes:@[@"fakescope"]
-                  extraScopesToConsent:nil
-                               account:account
-                            promptType:MSALPromptTypeDefault
-                  extraQueryParameters:nil
-                             authority:nil
-                         correlationId:nil
-                       completionBlock:^(MSALResult *rlt, NSError *error)
+    __auto_type parameters = [[MSALInteractiveTokenParameters alloc] initWithScopes:@[@"fakescope"]];
+    parameters.parentViewController = [self.class sharedViewControllerStub];
+    parameters.webviewParameters.webviewType = MSALWebviewTypeWKWebView;
+    parameters.promptType = MSALPromptTypeDefault;
+    parameters.account = account;
+    
+    [application acquireTokenWithParameters:parameters
+                            completionBlock:^(MSALResult *rlt, NSError *error)
      {
          result = rlt;
          
@@ -2607,3 +2818,5 @@
 }
 
 @end
+
+#pragma clang diagnostic pop

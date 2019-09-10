@@ -1,3 +1,24 @@
+## [0.7.0] - 2019-09-09
+### Added
+- iOS 13 support for ASWebAuthenticationSession
+- Support keychain access groups on macOS 10.15
+
+## [0.6.0] - 2019-08-22
+### Added 
+- Enable iOS 13 compatible broker
+- Implement ACL control for macOS keychain
+
+## [0.5.0] - 2019-07-30
+### Updated
+- Added initial macOS support
+- Better resolution of authorities for silent token acquisition
+- Added backward compatibility for legacy account storages
+- Added backward compatibility for ADAL macOS cache
+
+## [0.4.3] - 2019-05-24
+### Updated
+- Updated to newer v2 broker protocol version
+
 ## [0.4.2] - 2019-05-06
 ### Fixed
 - Applying 0.3.1 hotfix changes to latest 0.4.x release
@@ -11,6 +32,20 @@
 - Updated MSAL Public API surface to be more extensible and intuitive
 - Added support for custom B2C domains
 - Improved MSAL error handling
+
+## [0.3.4] - 2019-03-07
+### Fixed
+- Improve logging for token removal scenarios
+- Use ASCII for PKCE code challenge
+- Don't return Access token if ID token/Account are missing
+
+## [0.3.3] - 2019-05-29
+### Updated
+- Ignore cached fields in JSON if they contains "null"
+
+## [0.3.2] - 2019-05-24
+### Updated
+- Updated to newer v2 broker protocol version
 
 ## [0.3.1] - 2019-05-06
 ### Fixed

@@ -27,10 +27,19 @@
 
 
 #import "MSALCacheConfig.h"
+#import "MSALErrorConverter.h"
 
 #if TARGET_OS_IPHONE
 #import "MSIDKeychainTokenCache.h"
+#else
+#import "MSIDMacKeychainTokenCache.h"
 #endif
+
+@interface MSALCacheConfig()
+
+@property (nonatomic, readwrite) NSArray<id<MSALExternalAccountProviding>> *externalAccountProviders;
+
+@end
 
 @implementation MSALCacheConfig
   
@@ -39,9 +48,7 @@
     self = [super init];
     if (self)
     {
-#if TARGET_OS_IPHONE
         _keychainSharingGroup = keychainSharingGroup;
-#endif
     }
     return self;
 }
@@ -51,17 +58,13 @@
 #if TARGET_OS_IPHONE
     return MSIDKeychainTokenCache.defaultKeychainGroup;
 #else
-    return nil;
+    return MSIDMacKeychainTokenCache.defaultKeychainGroup;
 #endif
 }
 
 + (instancetype)defaultConfig
 {
-#if TARGET_OS_IPHONE
-    return [[self.class alloc] initWithKeychainSharingGroup:MSIDKeychainTokenCache.defaultKeychainGroup];
-#else
-    return [[self.class alloc] initWithKeychainSharingGroup:nil];
-#endif
+    return [[self.class alloc] initWithKeychainSharingGroup:self.defaultKeychainSharingGroup];
 }
 
 #pragma mark - NSCopying
@@ -69,7 +72,77 @@
 - (id)copyWithZone:(NSZone *)zone
 {
     NSString *keychainSharingGroup = [_keychainSharingGroup copyWithZone:zone];
-    return [[self.class alloc] initWithKeychainSharingGroup:keychainSharingGroup];
+    MSALCacheConfig *copiedConfig = [[self.class alloc] initWithKeychainSharingGroup:keychainSharingGroup];
+    copiedConfig->_externalAccountProviders = [[NSArray alloc] initWithArray:_externalAccountProviders copyItems:NO];
+#if !TARGET_OS_IPHONE
+    copiedConfig->_serializedADALCache = _serializedADALCache;
+#endif
+    return copiedConfig;
 }
+
+- (void)addExternalAccountProvider:(id<MSALExternalAccountProviding>)externalAccountProvider
+{
+    if (!externalAccountProvider)
+    {
+        return;
+    }
+    
+    NSMutableArray *newExternalProviders = [NSMutableArray new];
+    [newExternalProviders addObjectsFromArray:self.externalAccountProviders];
+    [newExternalProviders addObject:externalAccountProvider];
+    self.externalAccountProviders = newExternalProviders;
+}
+
+#if !TARGET_OS_IPHONE
+/*
+ This code will return nil if any of the passed in app paths is invalid.
+ */
+- (NSArray *)createTrustedApplicationListFromPaths:(NSArray<NSString *> *)appPaths error:(NSError * _Nullable __autoreleasing * _Nullable)error
+{
+    NSMutableArray *trustedApps = [NSMutableArray new];
+    OSStatus status;
+    SecTrustedApplicationRef myself = nil;
+    status = SecTrustedApplicationCreateFromPath(nil, &myself);
+    if (status != errSecSuccess)
+    {
+        NSError *msidError;
+        NSString *errorMessage = [NSString stringWithFormat:@"Failed to create trusted application for current path (status: %d).", status];
+        MSIDFillAndLogError(&msidError, MSIDErrorInvalidDeveloperParameter, errorMessage, nil);
+        
+        if (error)
+        {
+            *error = [MSALErrorConverter msalErrorFromMsidError:msidError];
+        }
+        
+        return nil;
+    }
+    
+    [trustedApps addObject:CFBridgingRelease(myself)];
+    
+    for (NSString *appPath in appPaths)
+    {
+        SecTrustedApplicationRef app = nil;
+        status = SecTrustedApplicationCreateFromPath([appPath UTF8String], &app);
+        if (status != errSecSuccess)
+        {
+            NSError *msidError;
+            NSString *errorMessage = [NSString stringWithFormat:@"Failed to create trusted application for path %@ (status: %d).", appPath, status];
+            MSIDFillAndLogError(&msidError, MSIDErrorInvalidDeveloperParameter, errorMessage, nil);
+            
+            if (error)
+            {
+                *error = [MSALErrorConverter msalErrorFromMsidError:msidError];
+            }
+            
+            return nil;
+        }
+        
+        [trustedApps addObject:CFBridgingRelease(app)];
+    }
+    
+    return [trustedApps count] ? trustedApps : nil;
+}
+
+#endif
 
 @end
